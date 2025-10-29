@@ -1,0 +1,42 @@
+# === Python cache and environment ===
+__pycache__/
+*.py[cod]
+*.pyo
+*.so
+*.egg
+*.egg-info/
+.env
+.venv
+venv/
+env/
+*.log
+
+# === Model checkpoints ===
+*.pt
+*.pth
+*.ckpt
+
+# === Dataset files ===
+*.csv
+*.npy
+*.zip
+*.tar
+*.gz
+*.nii
+*.nii.gz
+
+# === Jupyter / notebooks / IDE ===
+.ipynb_checkpoints/
+.idea/
+.vscode/
+*.iml
+
+# === Temporary files ===
+.DS_Store
+Thumbs.db
+*.tmp
+*.bak
+*.swp
+
+# === Local training dataset ===
+train/
