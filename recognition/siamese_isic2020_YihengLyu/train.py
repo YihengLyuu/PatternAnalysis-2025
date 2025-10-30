@@ -1,8 +1,3 @@
-# train.py
-# @edu:student-assignment
-# Training pipeline for Siamese ISIC2020 recognition
-# This version splits train/val by patient_id (grouped split to avoid leakage)
-
 import os
 import csv
 import argparse

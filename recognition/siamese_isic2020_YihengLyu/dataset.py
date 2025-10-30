@@ -1,7 +1,3 @@
-# dataset.py
-# @edu:student-assignment
-# Dataset and transform definitions for ISIC2020 Siamese training (with 'target' column support)
-
 import os
 import random
 from PIL import Image
