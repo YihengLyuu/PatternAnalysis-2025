@@ -1,122 +1,91 @@
 import os
 import random
-from typing import Tuple, Optional, List
-import pandas as pd
-from PIL import Image
+import cv2
+import numpy as np
 import torch
 from torch.utils.data import Dataset
 from torchvision import transforms
-from torchvision.transforms import InterpolationMode
+import pandas as pd
 
-def default_transforms(img_size: int = 192):
-    # 更强数据增强，提升泛化
+# ---------------------- transforms ----------------------
+def train_transforms(img_size):
     return transforms.Compose([
-        transforms.RandomResizedCrop(img_size, scale=(0.7, 1.0), ratio=(0.9, 1.1), interpolation=InterpolationMode.BILINEAR),
+        transforms.ToPILImage(),
+        transforms.Resize((img_size, img_size)),
         transforms.RandomHorizontalFlip(),
-        transforms.RandomVerticalFlip(p=0.1),
-        transforms.ColorJitter(0.2, 0.2, 0.2, 0.1),
-        transforms.RandomGrayscale(p=0.1),
-        transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 2.0)),
+        transforms.RandomRotation(10),
+        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                             std=[0.229, 0.224, 0.225]),
+        transforms.Normalize([0.5]*3, [0.5]*3)
     ])
 
-def eval_transforms(img_size: int = 192):
+def eval_transforms(img_size):
     return transforms.Compose([
-        transforms.Resize((img_size, img_size), interpolation=InterpolationMode.BILINEAR),
+        transforms.ToPILImage(),
+        transforms.Resize((img_size, img_size)),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                             std=[0.229, 0.224, 0.225]),
+        transforms.Normalize([0.5]*3, [0.5]*3)
     ])
 
+# ---------------------- 单图 ----------------------
+class ISIC2020Singles(Dataset):
+    def __init__(self, csv, images_dir, transform=None, ids_subset=None):
+        df = pd.read_csv(csv)
+        df["image_name"] = df["image_name"].astype(str)
+        if ids_subset is not None:
+            df = df[df["image_name"].isin(ids_subset)]
+        self.samples = list(zip(df["image_name"].tolist(), df["target"].tolist()))
+        self.images_dir = images_dir
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        name, label = self.samples[idx]
+        path_jpg = os.path.join(self.images_dir, f"{name}.jpg")
+        path_png = os.path.join(self.images_dir, f"{name}.png")
+        path = path_jpg if os.path.exists(path_jpg) else path_png
+        img = cv2.imread(path)
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        if self.transform:
+            img = self.transform(img)
+        return img, torch.tensor(float(label)), name
+
+# ---------------------- 成对数据 ----------------------
 class ISIC2020Pairs(Dataset):
-    """
-    在线采样 (x1, x2, same_label)，same_label: 1=同类，0=异类
-    root_dir/<image_name>.jpg; CSV: image_name,target
-    """
-    def __init__(self,
-                 csv_path: str,
-                 root_dir: str,
-                 transform=None,
-                 pairs_per_epoch: int = 100000,
-                 seed: int = 42):
-        super().__init__()
-        self.df = pd.read_csv(csv_path)
-        self.df["image_name"] = (self.df["image_name"]
-                                 .astype(str)
-                                 .str.replace(".jpg", "", regex=False)
-                                 .str.replace(".png", "", regex=False))
-        self.root = root_dir
-        self.transform = transform or default_transforms()
-        self.rng = random.Random(seed)
-
-        self.by_cls = {}
-        for cls, sub in self.df.groupby('target'):
-            self.by_cls[int(cls)] = list(sub['image_name'])
-
-        self.ids: List[str] = list(self.df['image_name'])
-        self.labels = dict(zip(self.df['image_name'], self.df['target']))
+    def __init__(self, csv, images_dir, split="train", pairs_per_epoch=2000, img_size=192):
+        df = pd.read_csv(csv)
+        self.images_dir = images_dir
+        self.img_size = img_size
+        self.samples = df
         self.pairs_per_epoch = pairs_per_epoch
+        self.transform = train_transforms(img_size) if split == "train" else eval_transforms(img_size)
+
+        self.pos = df[df["target"] == 1]["image_name"].tolist()
+        self.neg = df[df["target"] == 0]["image_name"].tolist()
 
     def __len__(self):
         return self.pairs_per_epoch
 
-    def _load_img(self, image_name: str) -> Image.Image:
-        for suf in ('.jpg', '.jpeg', '.png'):
-            p = os.path.join(self.root, image_name + suf)
-            if os.path.exists(p):
-                return Image.open(p).convert('RGB')
-        raise FileNotFoundError(f"Image file for {image_name} not found under {self.root}")
-
-    def __getitem__(self, idx) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        same = self.rng.random() < 0.5
-        img1_name = self.rng.choice(self.ids)
-        y1 = int(self.labels[img1_name])
-
-        if same:
-            img2_name = self.rng.choice(self.by_cls[y1])
-            y = 1.0
-        else:
-            other_cls = 1 - y1
-            if other_cls not in self.by_cls or len(self.by_cls[other_cls]) == 0:
-                img2_name = self.rng.choice(self.by_cls[y1]); y = 1.0
-            else:
-                img2_name = self.rng.choice(self.by_cls[other_cls]); y = 0.0
-
-        img1 = self._load_img(img1_name)
-        img2 = self._load_img(img2_name)
-        if self.transform:
-            img1 = self.transform(img1)
-            img2 = self.transform(img2)
-        return img1, img2, torch.tensor(y, dtype=torch.float32)
-
-class ISIC2020Singles(Dataset):
-    """ 单图评估/推理 """
-    def __init__(self, csv_path: str, root_dir: str, transform=None, ids_subset: Optional[List[str]] = None):
-        self.df = pd.read_csv(csv_path)
-        self.df["image_name"] = (self.df["image_name"]
-                                 .astype(str)
-                                 .str.replace(".jpg", "", regex=False)
-                                 .str.replace(".png", "", regex=False))
-        if ids_subset is not None:
-            ids_subset = [str(x).replace(".jpg","").replace(".png","") for x in ids_subset]
-            self.df = self.df[self.df['image_name'].isin(ids_subset)].reset_index(drop=True)
-
-        self.root = root_dir
-        self.transform = transform or eval_transforms()
-
-    def __len__(self):
-        return len(self.df)
+    def _load_img(self, name):
+        path_jpg = os.path.join(self.images_dir, f"{name}.jpg")
+        path_png = os.path.join(self.images_dir, f"{name}.png")
+        path = path_jpg if os.path.exists(path_jpg) else path_png
+        img = cv2.imread(path)
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        return self.transform(img)
 
     def __getitem__(self, idx):
-        row = self.df.iloc[idx]
-        name = row['image_name']
-        label = int(row['target'])
-        for suf in ('.jpg', '.jpeg', '.png'):
-            p = os.path.join(self.root, name + suf)
-            if os.path.exists(p):
-                img = Image.open(p).convert('RGB')
-                img = self.transform(img)
-                return img, label, name
-        raise FileNotFoundError(f"Image file for {name} not found under {self.root}")
+        same = random.random() > 0.5
+        if same:
+            cls = random.choice([self.pos, self.neg])
+            if len(cls) >= 2:
+                a, b = random.sample(cls, 2)
+            else:
+                a, b = cls[0], cls[0]
+            y = 1.0
+        else:
+            a, b = random.choice(self.pos), random.choice(self.neg)
+            y = 0.0
+        return self._load_img(a), self._load_img(b), torch.tensor(y, dtype=torch.float32)
