@@ -7,14 +7,15 @@ from modules import SiameseNet
 @torch.no_grad()
 def evaluate_linear_probe(ckpt_path, csv, images, img_size=192, batch_size=64):
     """
-    冻结 backbone，在线性层上做 80/20 简易评估，输出单图二分类准确率。
+    冻结 backbone，线性探针评估（80/20）。使用简单TTA（原图+水平翻转）的嵌入平均，提升最终 accuracy。
     """
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     ckpt = torch.load(ckpt_path, map_location=device)
     args_ckpt = ckpt.get("args", {})
-    embed_dim = args_ckpt.get("embed_dim", 128)
+    embed_dim = args_ckpt.get("embed_dim", 256)
+    backbone = args_ckpt.get("backbone", "resnet34")
 
-    model = SiameseNet(embedding_dim=embed_dim, pretrained=False).to(device)
+    model = SiameseNet(embedding_dim=embed_dim, backbone=backbone, pretrained=False).to(device)
     model.load_state_dict(ckpt["state_dict"], strict=False)
     model.eval()
 
@@ -29,11 +30,15 @@ def evaluate_linear_probe(ckpt_path, csv, images, img_size=192, batch_size=64):
                                ids_subset=[ds.df.iloc[i]['image_name'] for i in idx_test])
 
     def embed_dataset(ds_local):
-        loader = DataLoader(ds_local, batch_size=batch_size, shuffle=False, num_workers=2)
+        loader = DataLoader(ds_local, batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True)
         feats, labels = [], []
         for x, y, _ in loader:
-            x = x.to(device)
-            z = model.backbone(x)
+            x = x.to(device, non_blocking=True)
+            # TTA: 原图 + 水平翻转
+            x_flip = torch.flip(x, dims=[3])
+            z1 = model.backbone(x)
+            z2 = model.backbone(x_flip)
+            z = (z1 + z2) / 2.0
             feats.append(z.cpu())
             labels.extend(y.numpy().tolist())
         return torch.cat(feats), torch.tensor(labels, dtype=torch.float32)
@@ -44,8 +49,8 @@ def evaluate_linear_probe(ckpt_path, csv, images, img_size=192, batch_size=64):
     # 训练一个 logistic 回归（sigmoid）
     W = torch.zeros(Xtr.shape[1], 1, requires_grad=True)
     b = torch.zeros(1, requires_grad=True)
-    opt = torch.optim.Adam([W, b], lr=1e-2)
-    for _ in range(300):
+    opt = torch.optim.Adam([W, b], lr=5e-3, weight_decay=1e-4)
+    for _ in range(400):
         logits = Xtr @ W + b
         loss = torch.nn.functional.binary_cross_entropy_with_logits(logits.squeeze(1), ytr)
         opt.zero_grad(); loss.backward(); opt.step()

@@ -9,10 +9,14 @@ from torchvision import transforms
 from torchvision.transforms import InterpolationMode
 
 def default_transforms(img_size: int = 192):
+    # 更强数据增强，提升泛化
     return transforms.Compose([
-        transforms.Resize((img_size, img_size), interpolation=InterpolationMode.BILINEAR),
+        transforms.RandomResizedCrop(img_size, scale=(0.7, 1.0), ratio=(0.9, 1.1), interpolation=InterpolationMode.BILINEAR),
         transforms.RandomHorizontalFlip(),
-        transforms.RandomRotation(10, interpolation=InterpolationMode.BILINEAR),
+        transforms.RandomVerticalFlip(p=0.1),
+        transforms.ColorJitter(0.2, 0.2, 0.2, 0.1),
+        transforms.RandomGrayscale(p=0.1),
+        transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 2.0)),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406],
                              std=[0.229, 0.224, 0.225]),
@@ -29,7 +33,7 @@ def eval_transforms(img_size: int = 192):
 class ISIC2020Pairs(Dataset):
     """
     在线采样 (x1, x2, same_label)，same_label: 1=同类，0=异类
-    假设 root_dir/<image_name>.jpg 存在；CSV 包含: image_name,target
+    root_dir/<image_name>.jpg; CSV: image_name,target
     """
     def __init__(self,
                  csv_path: str,
@@ -39,7 +43,6 @@ class ISIC2020Pairs(Dataset):
                  seed: int = 42):
         super().__init__()
         self.df = pd.read_csv(csv_path)
-        # 统一去掉扩展名，避免 CSV 内含 .jpg/.png 造成找不到文件
         self.df["image_name"] = (self.df["image_name"]
                                  .astype(str)
                                  .str.replace(".jpg", "", regex=False)
@@ -48,7 +51,6 @@ class ISIC2020Pairs(Dataset):
         self.transform = transform or default_transforms()
         self.rng = random.Random(seed)
 
-        # 按类别索引
         self.by_cls = {}
         for cls, sub in self.df.groupby('target'):
             self.by_cls[int(cls)] = list(sub['image_name'])
@@ -69,7 +71,6 @@ class ISIC2020Pairs(Dataset):
 
     def __getitem__(self, idx) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         same = self.rng.random() < 0.5
-
         img1_name = self.rng.choice(self.ids)
         y1 = int(self.labels[img1_name])
 
@@ -79,11 +80,9 @@ class ISIC2020Pairs(Dataset):
         else:
             other_cls = 1 - y1
             if other_cls not in self.by_cls or len(self.by_cls[other_cls]) == 0:
-                img2_name = self.rng.choice(self.by_cls[y1])
-                y = 1.0
+                img2_name = self.rng.choice(self.by_cls[y1]); y = 1.0
             else:
-                img2_name = self.rng.choice(self.by_cls[other_cls])
-                y = 0.0
+                img2_name = self.rng.choice(self.by_cls[other_cls]); y = 0.0
 
         img1 = self._load_img(img1_name)
         img2 = self._load_img(img2_name)

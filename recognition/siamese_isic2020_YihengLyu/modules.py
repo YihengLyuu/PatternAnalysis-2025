@@ -3,28 +3,43 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torchvision import models
 
+def _make_backbone(name: str, pretrained: bool):
+    name = name.lower()
+    if name == "resnet18":
+        m = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1 if pretrained else None)
+        feat_dim = 512
+    elif name == "resnet34":
+        m = models.resnet34(weights=models.ResNet34_Weights.IMAGENET1K_V1 if pretrained else None)
+        feat_dim = 512
+    elif name == "resnet50":
+        m = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V2 if pretrained else None)
+        feat_dim = 2048
+    else:
+        raise ValueError(f"Unsupported backbone: {name}")
+    features = nn.Sequential(*list(m.children())[:-1])  # remove FC -> (B, C, 1, 1)
+    return features, feat_dim
+
 class EmbeddingNet(nn.Module):
     """
-    ResNet18 (ImageNet 预训练) -> GAP -> FC -> 归一化 embedding
+    Flexible backbone -> GAP -> FC -> BN -> L2-normalized embedding
     """
-    def __init__(self, embedding_dim: int = 128, pretrained: bool = True):
+    def __init__(self, embedding_dim: int = 256, backbone: str = "resnet34", pretrained: bool = True):
         super().__init__()
-        m = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1 if pretrained else None)
-        self.features = nn.Sequential(*list(m.children())[:-1])  # (B,512,1,1)
-        self.fc = nn.Linear(512, embedding_dim)
+        self.features, in_dim = _make_backbone(backbone, pretrained)
+        self.fc = nn.Linear(in_dim, embedding_dim)
         self.bn = nn.BatchNorm1d(embedding_dim)
 
     def forward(self, x):
-        x = self.features(x).flatten(1)   # (B,512)
+        x = self.features(x).flatten(1)   # (B, C)
         x = self.fc(x)
         x = self.bn(x)
         x = F.normalize(x, p=2, dim=1)
         return x
 
 class SiameseNet(nn.Module):
-    def __init__(self, embedding_dim: int = 128, pretrained: bool = True):
+    def __init__(self, embedding_dim: int = 256, backbone: str = "resnet34", pretrained: bool = True):
         super().__init__()
-        self.backbone = EmbeddingNet(embedding_dim=embedding_dim, pretrained=pretrained)
+        self.backbone = EmbeddingNet(embedding_dim=embedding_dim, backbone=backbone, pretrained=pretrained)
 
     def forward(self, x1, x2):
         z1 = self.backbone(x1)
