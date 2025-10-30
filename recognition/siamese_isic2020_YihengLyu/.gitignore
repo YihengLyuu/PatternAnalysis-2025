@@ -15,6 +15,7 @@ env/
 *.pt
 *.pth
 *.ckpt
+!runs_ep24_p5k_r18_d512/best.pt
 
 # === Dataset files ===
 *.csv
@@ -24,6 +25,7 @@ env/
 *.gz
 *.nii
 *.nii.gz
+!ISIC_2020_Training_GroundTruth.csv
 
 # === Jupyter / notebooks / IDE ===
 .ipynb_checkpoints/

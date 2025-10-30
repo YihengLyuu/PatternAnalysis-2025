@@ -1,0 +1,16 @@
+[Results — fixed threshold 0.5]
+Accuracy: 0.7899
+ROC-AUC : 0.8574
+F1 Score: 0.1097
+Confusion Matrix:
+[[25737  6805]
+ [  155   429]]
+
+[Results — optimal threshold for F1]
+Best Thr: 0.5200
+Accuracy: 0.9621
+ROC-AUC : 0.8574
+F1 Score: 0.1769
+Confusion Matrix:
+[[31735   807]
+ [  449   135]]
