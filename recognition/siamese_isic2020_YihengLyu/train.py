@@ -82,11 +82,15 @@ def get_col_indices(header):
 
 def grouped_split_by_patient(rows, header, val_ratio=0.2, seed=42, stratify=True):
     """
-    Split rows into train/val by patient_id groups.
+       Patient-level train/val split to prevent data leakage.
 
-    If stratify=True, we assign each patient a pseudo-label = max(target in that patient),
-    then do stratified split at patient level to keep class balance.
-    """
+       - We first group all rows by patient_id.
+       - Each patient is assigned a pseudo-label = max(target) within that patient.
+       - We then perform a stratified split at the patient level (positive / negative),
+         so that no patient appears in both train and val.
+       - Pair sampling (ISIC2020Pairs) is only applied *after* this split,
+         which ensures that pairs never mix patients across train/val.
+       """
     idx_img, idx_pid, idx_tgt = get_col_indices(header)
 
     # Group rows by patient_id

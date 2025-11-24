@@ -4,26 +4,32 @@ import argparse
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.data import DataLoader
+import torch.nn.functional as F
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+
 from sklearn.metrics import (
     accuracy_score, roc_auc_score, f1_score, confusion_matrix,
     precision_recall_curve, roc_curve
 )
-from tqdm import tqdm
-import matplotlib.pyplot as plt
+from sklearn.manifold import TSNE   # NEW: for embedding visualisation
+
 from dataset import ISIC2020Singles, eval_transforms
 from modules import SiameseNet
 
 
 # ===============================
-# Helper functions
+# Helper: state dict loading
 # ===============================
 def strip_module_prefix(state):
     if not isinstance(state, dict):
         return state
-    return { (k[len("module."):] if k.startswith("module.") else k): v
-             for k, v in state.items() }
+    return {
+        (k[len("module."):] if k.startswith("module.") else k): v
+        for k, v in state.items()
+    }
+
 
 def load_state_flex(path, device):
     ckpt = torch.load(path, map_location=device)
@@ -39,11 +45,18 @@ def load_state_flex(path, device):
     return strip_module_prefix(state)
 
 
+# ===============================
+# Embedding extraction (with TTA)
+# ===============================
 @torch.no_grad()
-def _embed_with_tta(model, loader, device, tta=True, desc="Embed"):
+def embed_split(model, records, images_dir, device, batch_size=64,
+                tta=True, desc="Embed"):
+    ds = ISIC2020Singles(records, images_dir, transform=eval_transforms)
+    dl = DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=4)
+
     model.eval()
     feats, labels = [], []
-    pbar = tqdm(loader, desc=desc, ncols=100)
+    pbar = tqdm(dl, desc=desc, ncols=100)
     for x, y, _ in pbar:
         x = x.to(device, non_blocking=True)
         if tta:
@@ -53,107 +66,140 @@ def _embed_with_tta(model, loader, device, tta=True, desc="Embed"):
             z = model(x)
         feats.append(z.cpu())
         labels.extend(y.numpy().tolist())
-    return torch.cat(feats, dim=0), torch.tensor(labels, dtype=torch.float32)
+
+    feats = torch.cat(feats, dim=0)           # [N, D]
+    labels = torch.tensor(labels, dtype=torch.float32)
+    return feats, labels
 
 
 # ===============================
-# Main evaluation
+# Linear probe training
 # ===============================
-def evaluate_linear_probe(model, records, images_dir, device, batch_size=64, tta=True, outdir=None):
-    ds = ISIC2020Singles(records, images_dir, transform=eval_transforms)
-    dl = DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=4)
+def train_linear_probe(feats_train, labels_train, device, epochs=15, lr=1e-3):
+    X = feats_train.to(device)
+    y = labels_train.to(device)
 
-    # 1) 提取嵌入
-    feats, labels = _embed_with_tta(model, dl, device, tta=tta, desc="Embed")
-    n_pos = int(labels.sum().item())
-    n_neg = int(len(labels) - n_pos)
+    n_pos = int(y.sum().item())
+    n_neg = int(len(y) - n_pos)
     if n_pos == 0:
-        raise RuntimeError("No positive samples found. Check CSV 'target' column.")
+        raise RuntimeError("No positive samples found in TRAIN split.")
+    pos_weight = torch.tensor([n_neg / max(1, n_pos)],
+                              dtype=torch.float32, device=device)
 
-    # 2) 训练线性探针（类不平衡加权）
-    probe = nn.Linear(feats.shape[1], 1).to(device)
-    pos_weight = torch.tensor([n_neg / max(1, n_pos)], dtype=torch.float32, device=device)
+    probe = nn.Linear(X.shape[1], 1).to(device)
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-    opt = torch.optim.Adam(probe.parameters(), lr=1e-3)
+    opt = torch.optim.Adam(probe.parameters(), lr=lr)
 
-    print("[Train linear probe] (pos_weight = {:.1f})".format(pos_weight.item()))
-    X = feats.to(device)
-    y = labels.to(device)
-    for e in range(15):
+    print(f"[Train linear probe] (pos_weight = {pos_weight.item():.1f})")
+    for e in range(epochs):
         probe.train()
         opt.zero_grad()
         logits = probe(X).squeeze(1)
         loss = criterion(logits, y)
         loss.backward()
         opt.step()
-        print(f"  Epoch {e+1}/15 loss={loss.item():.4f}")
+        print(f"  Epoch {e+1}/{epochs} loss={loss.item():.4f}")
 
-    # 3) 推理与指标计算
+    return probe
+
+
+# ===============================
+# Evaluation on one split
+# ===============================
+def evaluate_split(probe, feats, labels, split_name, out_fh=None):
     probe.eval()
-    logits = probe(X).squeeze(1)
-    probs = torch.sigmoid(logits).detach().cpu().numpy()   # ✅ 修复 detach 报错
-    y_true = labels.numpy().astype(int)
+    X = feats.to(probe.weight.device)
+    y = labels.cpu().numpy().astype(int)
 
-    auc = roc_auc_score(y_true, probs)
+    with torch.no_grad():
+        logits = probe(X).squeeze(1)
+        probs = torch.sigmoid(logits).cpu().numpy()
+
+    auc = roc_auc_score(y, probs)
+
+    # fixed threshold 0.5
     preds_050 = (probs >= 0.5).astype(int)
-    acc_050 = accuracy_score(y_true, preds_050)
-    f1_050  = f1_score(y_true, preds_050, zero_division=0)
-    cm_050  = confusion_matrix(y_true, preds_050)
+    acc_050 = accuracy_score(y, preds_050)
+    f1_050 = f1_score(y, preds_050, zero_division=0)
+    cm_050 = confusion_matrix(y, preds_050)
 
-    # 搜索最佳 F1 阈值
-    precisions, recalls, ths_pr = precision_recall_curve(y_true, probs)
+    # best F1 threshold
+    precisions, recalls, ths_pr = precision_recall_curve(y, probs)
     f1s = 2 * precisions * recalls / np.maximum(precisions + recalls, 1e-8)
     best_idx = int(np.nanargmax(f1s))
     best_thr = ths_pr[max(best_idx - 1, 0)] if best_idx < len(ths_pr) else 0.5
     preds_best = (probs >= best_thr).astype(int)
-    acc_best = accuracy_score(y_true, preds_best)
-    f1_best  = f1_score(y_true, preds_best, zero_division=0)
-    cm_best  = confusion_matrix(y_true, preds_best)
+    acc_best = accuracy_score(y, preds_best)
+    f1_best = f1_score(y, preds_best, zero_division=0)
+    cm_best = confusion_matrix(y, preds_best)
 
-    print("\n[Results — fixed threshold 0.5]")
-    print(f"Accuracy: {acc_050:.4f}")
-    print(f"ROC-AUC : {auc:.4f}")
-    print(f"F1 Score: {f1_050:.4f}")
-    print("Confusion Matrix:\n", cm_050)
+    def _print_and_write(line=""):
+        print(line)
+        if out_fh is not None:
+            out_fh.write(line + "\n")
 
-    print("\n[Results — optimal threshold for F1]")
-    print(f"Best Thr: {best_thr:.4f}")
-    print(f"Accuracy: {acc_best:.4f}")
-    print(f"ROC-AUC : {auc:.4f}")
-    print(f"F1 Score: {f1_best:.4f}")
-    print("Confusion Matrix:\n", cm_best)
+    _print_and_write(f"\n[Results — {split_name}]")
+    _print_and_write(f"ROC-AUC : {auc:.4f}")
+    _print_and_write(f"Accuracy (thr=0.5): {acc_050:.4f}")
+    _print_and_write(f"F1       (thr=0.5): {f1_050:.4f}")
+    _print_and_write(f"Confusion (thr=0.5):\n{cm_050}")
+    _print_and_write(f"Best F1 threshold : {best_thr:.4f}")
+    _print_and_write(f"Accuracy (best F1): {acc_best:.4f}")
+    _print_and_write(f"F1       (best F1): {f1_best:.4f}")
+    _print_and_write(f"Confusion (best F1):\n{cm_best}")
 
-    # 4) 保存结果与 ROC 曲线
-    if outdir:
-        os.makedirs(outdir, exist_ok=True)
-        txt_path = os.path.join(outdir, "eval_results.txt")
-        with open(txt_path, "w", encoding="utf-8") as f:
-            f.write(f"[Results — fixed threshold 0.5]\n")
-            f.write(f"Accuracy: {acc_050:.4f}\n")
-            f.write(f"ROC-AUC : {auc:.4f}\n")
-            f.write(f"F1 Score: {f1_050:.4f}\n")
-            f.write(f"Confusion Matrix:\n{cm_050}\n\n")
-            f.write(f"[Results — optimal threshold for F1]\n")
-            f.write(f"Best Thr: {best_thr:.4f}\n")
-            f.write(f"Accuracy: {acc_best:.4f}\n")
-            f.write(f"ROC-AUC : {auc:.4f}\n")
-            f.write(f"F1 Score: {f1_best:.4f}\n")
-            f.write(f"Confusion Matrix:\n{cm_best}\n")
-        print(f"\n✅ Evaluation results saved to: {txt_path}")
+    return {
+        "auc": auc,
+        "acc_050": acc_050,
+        "f1_050": f1_050,
+        "cm_050": cm_050,
+        "best_thr": best_thr,
+        "acc_best": acc_best,
+        "f1_best": f1_best,
+        "cm_best": cm_best,
+        "probs": probs,
+        "y_true": y,
+    }
 
-        # ROC 曲线保存
-        fpr, tpr, _ = roc_curve(y_true, probs)
-        plt.figure()
-        plt.plot(fpr, tpr, color="blue", lw=2, label=f"ROC curve (AUC = {auc:.3f})")
-        plt.plot([0, 1], [0, 1], "k--", lw=1)
-        plt.xlabel("False Positive Rate")
-        plt.ylabel("True Positive Rate")
-        plt.title("Receiver Operating Characteristic")
-        plt.legend(loc="lower right")
-        roc_path = os.path.join(outdir, "roc_curve.png")
-        plt.savefig(roc_path, dpi=200)
-        plt.close()
-        print(f"📈 ROC curve saved to: {roc_path}")
+
+# ===============================
+# t-SNE visualisation
+# ===============================
+def visualize_tsne(feats, labels, outdir, split_name="test", max_points=2000):
+    os.makedirs(outdir, exist_ok=True)
+
+    X = feats.cpu().numpy()
+    y = labels.cpu().numpy().astype(int)
+
+    n = len(X)
+    if n > max_points:
+        idx = np.random.choice(n, size=max_points, replace=False)
+        X = X[idx]
+        y = y[idx]
+
+    print(f"[t-SNE] running on {len(X)} points for split '{split_name}'...")
+    tsne = TSNE(n_components=2, random_state=42, perplexity=30)
+    X_2d = tsne.fit_transform(X)
+
+    plt.figure(figsize=(6, 6))
+    # 简单双类配色：0 = benign, 1 = melanoma
+    for cls, name in [(0, "benign"), (1, "melanoma")]:
+        mask = (y == cls)
+        plt.scatter(
+            X_2d[mask, 0],
+            X_2d[mask, 1],
+            s=6,
+            alpha=0.6,
+            label=name
+        )
+    plt.title(f"t-SNE of embeddings ({split_name} split)")
+    plt.xlabel("Dim 1")
+    plt.ylabel("Dim 2")
+    plt.legend()
+    out_path = os.path.join(outdir, f"tsne_{split_name}.png")
+    plt.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close()
+    print(f"[t-SNE] saved to {out_path}")
 
 
 # ===============================
@@ -163,37 +209,100 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--checkpoint", "--weights", dest="ckpt", type=str, required=True,
                     help="Path to model weights (.pt)")
-    ap.add_argument("--csv", type=str, required=True)
-    ap.add_argument("--images", type=str, required=True)
+
+    # 兼容旧接口：如果你只给 --csv / --images，就会被当成 both train & test
+    ap.add_argument("--csv", type=str, default=None,
+                    help="(legacy) CSV used for both train and test")
+    ap.add_argument("--images", type=str, default=None,
+                    help="(legacy) image dir used for both train and test")
+
+    # 新接口：明确的 train / test
+    ap.add_argument("--train_csv", type=str, default=None)
+    ap.add_argument("--train_images", type=str, default=None)
+    ap.add_argument("--test_csv", type=str, default=None,
+                    help="CSV for the 1,000-image test split")
+    ap.add_argument("--test_images", type=str, default=None)
     ap.add_argument("--batch_size", type=int, default=64)
     ap.add_argument("--outdir", type=str, default="eval_results")
     ap.add_argument("--no_tta", action="store_true")
     ap.add_argument("--backbone", type=str, default="resnet34",
                     choices=["resnet18", "resnet34", "resnet50"])
     ap.add_argument("--embed_dim", type=int, default=256)
+    ap.add_argument("--tsne_points", type=int, default=2000,
+                    help="max points used for t-SNE")
     args = ap.parse_args()
 
-    with open(args.csv, encoding="utf-8-sig") as f:
-        reader = csv.reader(f)
-        records = [r for r in reader]
+    # --------- resolve train/test paths (兼容旧参数) ----------
+    if args.train_csv is None or args.train_images is None:
+        # 用旧接口
+        if args.csv is None or args.images is None:
+            raise ValueError("Either (--train_csv & --train_images) or (--csv & --images) must be provided.")
+        args.train_csv = args.csv
+        args.train_images = args.images
+
+    if args.test_csv is None or args.test_images is None:
+        # 如果没给 test，就默认 test=train（不推荐，但保持兼容）
+        args.test_csv = args.train_csv
+        args.test_images = args.train_images
+
+    # --------- load CSV records ----------
+    def load_records(path):
+        with open(path, encoding="utf-8-sig") as f:
+            reader = csv.reader(f)
+            return [r for r in reader if r]
+
+    train_records = load_records(args.train_csv)
+    test_records = load_records(args.test_csv)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[Load] {args.ckpt}")
+    print(f"[Load] checkpoint: {args.ckpt}")
     model = SiameseNet(backbone=args.backbone, embed_dim=args.embed_dim).to(device)
     state = load_state_flex(args.ckpt, device)
     missing, unexpected = model.load_state_dict(state, strict=False)
     if missing or unexpected:
         print(f"[Warn] Missing keys: {missing}\n[Warn] Unexpected keys: {unexpected}")
 
-    evaluate_linear_probe(
-        model=model,
-        records=records,
-        images_dir=args.images,
-        device=device,
-        batch_size=args.batch_size,
-        tta=not args.no_tta,
-        outdir=args.outdir,
+    # --------- extract embeddings ----------
+    feats_train, labels_train = embed_split(
+        model, train_records, args.train_images,
+        device=device, batch_size=args.batch_size,
+        tta=not args.no_tta, desc="Embed train"
     )
+    feats_test, labels_test = embed_split(
+        model, test_records, args.test_images,
+        device=device, batch_size=args.batch_size,
+        tta=not args.no_tta, desc="Embed test"
+    )
+
+    # --------- train linear probe on TRAIN only ----------
+    probe = train_linear_probe(feats_train, labels_train, device=device, epochs=15, lr=1e-3)
+
+    # --------- evaluate on TRAIN & TEST ----------
+    os.makedirs(args.outdir, exist_ok=True)
+    txt_path = os.path.join(args.outdir, "eval_results.txt")
+    with open(txt_path, "w", encoding="utf-8") as f:
+        res_train = evaluate_split(probe, feats_train, labels_train, "TRAIN", out_fh=f)
+        res_test = evaluate_split(probe, feats_test, labels_test, "TEST (1,000 images)", out_fh=f)
+    print(f"\n✅ Evaluation results saved to: {txt_path}")
+
+    # --------- ROC curve on TEST ----------
+    fpr, tpr, _ = roc_curve(res_test["y_true"], res_test["probs"])
+    plt.figure()
+    plt.plot(fpr, tpr, lw=2, label=f"ROC (AUC = {res_test['auc']:.3f})")
+    plt.plot([0, 1], [0, 1], "k--", lw=1)
+    plt.xlabel("False Positive Rate")
+    plt.ylabel("True Positive Rate")
+    plt.title("ROC curve – TEST split")
+    plt.legend(loc="lower right")
+    roc_path = os.path.join(args.outdir, "roc_curve_test.png")
+    plt.savefig(roc_path, dpi=200)
+    plt.close()
+    print(f"📈 Test ROC curve saved to: {roc_path}")
+
+    # --------- t-SNE on TEST embeddings ----------
+    visualize_tsne(feats_test, labels_test, args.outdir,
+                   split_name="test", max_points=args.tsne_points)
+
 
 if __name__ == "__main__":
     main()
